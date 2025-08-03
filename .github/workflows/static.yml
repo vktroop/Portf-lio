@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VKProject - Seu Portfólio de Vídeos</title>
+    <!-- Inclui o Tailwind CSS para um design rápido e responsivo -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Importa os módulos do Firebase -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, deleteDoc, onSnapshot, collection, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Variáveis globais fornecidas pelo ambiente do Canvas
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // Inicializa o Firebase
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+        const auth = getAuth(app);
+
+        // Armazena o estado da aplicação
+        let allVideos = [];
+        let myFavorites = {};
+        let myRatings = {};
+        let currentView = 'all'; // 'all' ou 'favorites'
+        let userId = null;
+
+        // Elementos da UI
+        const videoGrid = document.getElementById('video-grid');
+        const loadingMessage = document.getElementById('loading-message');
+        const searchInput = document.getElementById('search-input');
+        const homeBtn = document.getElementById('home-btn');
+        const myListBtn = document.getElementById('my-list-btn');
+
+        // Estilos
+        const activeNavClass = 'text-white font-bold border-b-2 border-red-500';
+        const inactiveNavClass = 'text-gray-400 font-medium';
+
+        // Autentica o usuário
+        async function authenticateAndSetup() {
+            try {
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Erro na autenticação:", error);
+            }
+        }
+
+        // Observa o estado de autenticação para configurar o Firestore
+        onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                userId = user.uid;
+                console.log("Usuário autenticado com ID:", userId);
+                
+                // Configura o listener do Firestore para a lista de favoritos
+                const favoritesRef = collection(db, 'artifacts', appId, 'users', userId, 'favorite-videos');
+                onSnapshot(favoritesRef, (snapshot) => {
+                    myFavorites = {};
+                    snapshot.docs.forEach(doc => {
+                        myFavorites[doc.id] = doc.data();
+                    });
+                    if (currentView === 'favorites') {
+                        filterAndDisplayVideos(searchInput.value);
+                    }
+                    filterAndDisplayVideos(searchInput.value);
+                });
+
+                // Carrega todas as avaliações do usuário para a UI
+                const ratingsRef = collection(db, 'artifacts', appId, 'users', userId, 'my-ratings');
+                const userRatingsSnapshot = await getDocs(ratingsRef);
+                userRatingsSnapshot.forEach(doc => {
+                    myRatings[doc.id] = doc.data().rating;
+                });
+                
+                fetchYouTubeVideos();
+            } else {
+                console.log("Nenhum usuário autenticado.");
+            }
+        });
+
+        /**
+         * Adiciona um vídeo à lista de favoritos do usuário.
+         * @param {object} video - Objeto do vídeo a ser adicionado.
+         */
+        async function addVideoToMyList(video) {
+            if (!userId) return;
+            const videoId = video.id.videoId;
+            const videoRef = doc(db, 'artifacts', appId, 'users', userId, 'favorite-videos', videoId);
+            try {
+                await setDoc(videoRef, {
+                    id: videoId,
+                    title: video.snippet.title,
+                    thumbnailUrl: video.snippet.thumbnails.medium.url,
+                    publishedAt: video.snippet.publishedAt
+                });
+            } catch (e) {
+                console.error("Erro ao adicionar vídeo à lista:", e);
+            }
+        }
+
+        /**
+         * Remove um vídeo da lista de favoritos do usuário.
+         * @param {string} videoId - ID do vídeo a ser removido.
+         */
+        async function removeVideoFromMyList(videoId) {
+            if (!userId) return;
+            const videoRef = doc(db, 'artifacts', appId, 'users', userId, 'favorite-videos', videoId);
+            try {
+                await deleteDoc(videoRef);
+            } catch (e) {
+                console.error("Erro ao remover vídeo da lista:", e);
+            }
+        }
+        
+        /**
+         * Salva a avaliação de um vídeo no Firestore.
+         * @param {string} videoId - O ID do vídeo avaliado.
+         * @param {number} rating - A nota de 1 a 5.
+         */
+        async function saveRating(videoId, rating) {
+            if (!userId) {
+                console.error("Usuário não autenticado. Não é possível salvar a avaliação.");
+                return;
+            }
+            // Salva a avaliação do usuário na coleção privada
+            const userRatingRef = doc(db, 'artifacts', appId, 'users', userId, 'my-ratings', videoId);
+            await setDoc(userRatingRef, { rating });
+            myRatings[videoId] = rating;
+
+            // Salva a avaliação na coleção pública para cálculo da média
+            const publicRatingRef = doc(db, 'artifacts', appId, 'public', 'data', 'ratings', videoId, 'userRatings', userId);
+            await setDoc(publicRatingRef, { rating, userId, timestamp: new Date() });
+            
+            // Recarrega a UI para mostrar a nova média
+            filterAndDisplayVideos(searchInput.value);
+        }
+
+        /**
+         * Calcula e exibe a média de avaliações para um vídeo.
+         * @param {string} videoId - O ID do vídeo.
+         * @param {HTMLElement} ratingContainer - O elemento HTML onde a média será exibida.
+         */
+        async function fetchAndDisplayRating(videoId, ratingContainer) {
+            const ratingsRef = collection(db, 'artifacts', appId, 'public', 'data', 'ratings', videoId, 'userRatings');
+            const ratingsSnapshot = await getDocs(ratingsRef);
+
+            let total = 0;
+            let count = 0;
+            ratingsSnapshot.forEach(doc => {
+                total += doc.data().rating;
+                count++;
+            });
+
+            const averageRating = count > 0 ? (total / count).toFixed(1) : 'N/A';
+            const userRating = myRatings[videoId] || 0;
+
+            ratingContainer.innerHTML = `
+                <div class="flex items-center space-x-1">
+                    ${[1, 2, 3, 4, 5].map(starIndex => `
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 star-icon cursor-pointer ${starIndex <= userRating ? 'text-yellow-400' : 'text-gray-400'}" data-rating="${starIndex}" viewBox="0 0 20 20" fill="currentColor">
+                            <path d="M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.286 3.95a1 1 0 00.95.69h4.16c.969 0 1.371 1.24.588 1.81l-3.374 2.45c-.3.22-.48.604-.183.924l1.286 3.95c.3.921-.755 1.688-1.538 1.118L10 14.157l-3.374 2.45c-.783.57-1.838-.197-1.538-1.118l1.286-3.95c.297-.92.117-1.285-.183-1.505l-3.374-2.45c-.783-.57-.381-1.81.588-1.81h4.16c.356 0 .684-.207.95-.69l1.286-3.95z"/>
+                        </svg>
+                    `).join('')}
+                </div>
+                <span class="text-xs text-gray-400">${averageRating} (${count})</span>
+            `;
+
+            ratingContainer.querySelectorAll('.star-icon').forEach(star => {
+                star.addEventListener('click', () => {
+                    const rating = parseInt(star.dataset.rating, 10);
+                    saveRating(videoId, rating);
+                });
+            });
+        }
+
+
+        /**
+         * Função para renderizar um card de vídeo na grade.
+         * @param {object} video - O objeto de dados do vídeo.
+         */
+        function renderVideoCard(video) {
+            const videoId = video.id.videoId || video.id;
+            const thumbnailUrl = video.snippet?.thumbnails?.medium?.url || video.thumbnailUrl;
+            const title = video.snippet?.title || video.title;
+            const isFavorite = !!myFavorites[videoId];
+            
+            const videoCard = document.createElement('div');
+            videoCard.className = 'group relative overflow-hidden rounded-lg shadow-lg transform transition-transform duration-300 hover:scale-105';
+            
+            videoCard.innerHTML = `
+                <a href="https://www.youtube.com/watch?v=${videoId}" target="_blank" class="block">
+                    <div class="aspect-w-16 aspect-h-9 w-full h-auto">
+                        <img src="${thumbnailUrl}" alt="${title}" class="w-full h-full object-cover">
+                    </div>
+                    <div class="absolute inset-0 bg-gradient-to-t from-black via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex items-end p-4">
+                        <h3 class="text-white text-sm font-semibold truncate">${title}</h3>
+                    </div>
+                </a>
+                <button class="favorite-btn absolute top-2 right-2 p-2 rounded-full bg-black/50 text-white transition-colors duration-300 hover:bg-red-500 z-10">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 24 24" fill="${isFavorite ? 'red' : 'none'}" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/>
+                    </svg>
+                </button>
+                <div class="p-2 flex items-center justify-between">
+                    <div class="rating-container flex items-center space-x-1">
+                        <!-- Estrelas e média serão renderizadas aqui -->
+                    </div>
+                </div>
+            `;
+            
+            const favoriteBtn = videoCard.querySelector('.favorite-btn');
+            favoriteBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (isFavorite) {
+                    removeVideoFromMyList(videoId);
+                } else {
+                    addVideoToMyList(video);
+                }
+            });
+
+            videoGrid.appendChild(videoCard);
+            
+            const ratingContainer = videoCard.querySelector('.rating-container');
+            fetchAndDisplayRating(videoId, ratingContainer);
+        }
+
+        /**
+         * Função para filtrar e exibir os vídeos.
+         * @param {string} searchTerm - Termo de busca.
+         */
+        function filterAndDisplayVideos(searchTerm = '') {
+            videoGrid.innerHTML = '';
+            let videosToDisplay = [];
+            const lowerCaseSearchTerm = searchTerm.toLowerCase();
+
+            if (currentView === 'all') {
+                videosToDisplay = allVideos.filter(video =>
+                    video.snippet.title.toLowerCase().includes(lowerCaseSearchTerm)
+                );
+            } else { // favorites
+                videosToDisplay = Object.values(myFavorites).filter(video =>
+                    video.title.toLowerCase().includes(lowerCaseSearchTerm)
+                );
+            }
+
+            if (videosToDisplay.length > 0) {
+                videosToDisplay.forEach(renderVideoCard);
+            } else {
+                videoGrid.innerHTML = `<p class="text-center text-gray-400 col-span-full">${currentView === 'all' ? 'Nenhum vídeo encontrado.' : 'Sua lista de favoritos está vazia.'}</p>`;
+            }
+        }
+
+        /**
+         * Função assíncrona para buscar vídeos do canal do YouTube.
+         */
+        async function fetchYouTubeVideos() {
+            const API_KEY = 'SUA_CHAVE_DE_API';
+            const CHANNEL_ID = 'ID_DO_SEU_CANAL';
+
+            if (API_KEY === 'SUA_CHAVE_DE_API' || CHANNEL_ID === 'ID_DO_SEU_CANAL') {
+                loadingMessage.textContent = 'Por favor, insira sua chave de API e ID do canal no código.';
+                return;
+            }
+
+            const apiUrl = `https://www.googleapis.com/youtube/v3/search?key=${API_KEY}&channelId=${CHANNEL_ID}&part=snippet,id&order=date&maxResults=20`;
+
+            try {
+                const response = await fetch(apiUrl);
+                if (!response.ok) {
+                    throw new Error(`Erro na API: ${response.status}`);
+                }
+                const data = await response.json();
+                
+                loadingMessage.style.display = 'none';
+
+                if (data.items && data.items.length > 0) {
+                    allVideos = data.items.filter(item => item.id.kind === 'youtube#video');
+                    filterAndDisplayVideos();
+                } else {
+                    videoGrid.innerHTML = '<p class="text-center text-gray-400 col-span-full">Nenhum vídeo encontrado. Verifique o ID do canal.</p>';
+                }
+            } catch (error) {
+                console.error('Falha ao buscar vídeos:', error);
+                loadingMessage.textContent = 'Erro ao carregar vídeos. Tente novamente mais tarde.';
+            }
+        }
+
+        // Event listener para a barra de pesquisa
+        searchInput.addEventListener('input', (e) => {
+            filterAndDisplayVideos(e.target.value);
+        });
+        
+        // Event listeners para a navegação
+        homeBtn.addEventListener('click', () => {
+            currentView = 'all';
+            homeBtn.classList.add(...activeNavClass.split(' '));
+            myListBtn.classList.remove(...activeNavClass.split(' '));
+            myListBtn.classList.add(...inactiveNavClass.split(' '));
+            filterAndDisplayVideos(searchInput.value);
+        });
+
+        myListBtn.addEventListener('click', () => {
+            currentView = 'favorites';
+            myListBtn.classList.add(...activeNavClass.split(' '));
+            homeBtn.classList.remove(...activeNavClass.split(' '));
+            homeBtn.classList.add(...inactiveNavClass.split(' '));
+            filterAndDisplayVideos(searchInput.value);
+        });
+
+        // Inicia o processo de autenticação e busca
+        authenticateAndSetup();
+    </script>
+</head>
+<body class="p-4 md:p-8">
+
+    <!-- Cabeçalho da página -->
+    <header class="mb-8 md:mb-10">
+        <div class="flex flex-col md:flex-row justify-between items-center mb-6">
+            <h1 class="text-3xl md:text-5xl font-bold text-red-500 tracking-wider mb-4 md:mb-0">VKProject</h1>
+            <nav class="w-full md:w-auto">
+                <ul class="flex justify-center space-x-4 text-sm md:text-base">
+                    <li><button id="home-btn" class="transition duration-300 px-2 py-1 border-b-2 border-transparent text-white font-bold">Home</button></li>
+                    <li><button id="my-list-btn" class="transition duration-300 px-2 py-1 border-b-2 border-transparent text-gray-400 font-medium">Minha Lista</button></li>
+                </ul>
+            </nav>
+        </div>
+
+        <!-- Barra de pesquisa -->
+        <div class="w-full max-w-2xl mx-auto">
+            <input type="text" id="search-input" placeholder="Pesquisar vídeos..."
+                   class="w-full p-3 rounded-lg bg-gray-800 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-red-500 transition duration-300">
+        </div>
+    </header>
+
+    <!-- Seção de Destaques (Grid de Vídeos) -->
+    <section class="mb-12">
+        <h2 class="text-xl md:text-2xl font-semibold mb-6">Destaques</h2>
+        <div id="video-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4">
+            <!-- Os vídeos serão carregados aqui pelo JavaScript -->
+            <p id="loading-message" class="text-center text-gray-400 col-span-full">Carregando vídeos...</p>
+        </div>
+    </section>
+
+    <!-- Rodapé da página -->
+    <footer class="mt-12 text-center text-gray-500 text-sm">
+        <p>&copy; 2025 VKProject. Todos os direitos reservados.</p>
+    </footer>
+
+</body>
+</html>
+
